@@ -11,6 +11,7 @@ import requests
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
+from datetime import datetime
 
 CACHE_DIR = ".crypto_cache"
 BASE_URL = "https://api.coingecko.com/api/v3"
@@ -1347,4 +1348,516 @@ def batch_scalp_scan(coins: List[Dict], top_n: int = 30) -> List[Dict]:
             time.sleep(0.5)
 
     results.sort(key=lambda x: x["scalp_score"], reverse=True)
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRADING SIGNALS — Strategy Engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+def macd_strategy_signal(df: pd.DataFrame) -> Dict:
+    """
+    MACD strategy with fast=3, slow=15, signal=3.
+    Detects bullish crossovers and strong bullish momentum.
+    """
+    result = {
+        "active": False,
+        "direction": "NEUTRAL",
+        "strength": 0,
+        "note": "Sin señal MACD",
+        "macd_val": 0.0,
+        "signal_val": 0.0,
+        "hist_val": 0.0,
+    }
+
+    if df is None or len(df) < 20:
+        return result
+
+    close = df["close"]
+    macd_line, sig_line, hist = calc_macd(close, fast=3, slow=15, signal=3)
+
+    if len(macd_line) < 3:
+        return result
+
+    macd_cur = float(macd_line.iloc[-1])
+    macd_prev = float(macd_line.iloc[-2])
+    sig_cur = float(sig_line.iloc[-1])
+    sig_prev = float(sig_line.iloc[-2])
+    hist_cur = float(hist.iloc[-1])
+    hist_prev = float(hist.iloc[-2])
+    hist_prev2 = float(hist.iloc[-3]) if len(hist) >= 3 else hist_prev
+
+    result["macd_val"] = macd_cur
+    result["signal_val"] = sig_cur
+    result["hist_val"] = hist_cur
+
+    ema20 = calc_ema(close, 20)
+    price_above_ema20 = float(close.iloc[-1]) > float(ema20.iloc[-1])
+
+    # Bullish crossover: MACD crosses above signal
+    bullish_cross = (macd_prev < sig_prev) and (macd_cur > sig_cur)
+
+    # Strong bullish: histogram growing positive for 2+ bars AND price above EMA20
+    hist_growing = (hist_cur > 0) and (hist_cur > hist_prev) and (hist_prev > hist_prev2)
+    strong_bullish = hist_growing and price_above_ema20
+
+    if strong_bullish:
+        result["active"] = True
+        result["direction"] = "LONG"
+        result["strength"] = 80
+        result["note"] = "MACD fuerte: histograma positivo creciente 2+ velas y precio sobre EMA20"
+    elif bullish_cross:
+        result["active"] = True
+        result["direction"] = "LONG"
+        result["strength"] = 65
+        result["note"] = f"MACD cruzó al alza la línea de señal (MACD: {macd_cur:.4f} > Señal: {sig_cur:.4f})"
+
+    # Bearish check
+    bearish_cross = (macd_prev > sig_prev) and (macd_cur < sig_cur)
+    if bearish_cross and not result["active"]:
+        result["active"] = True
+        result["direction"] = "SHORT"
+        result["strength"] = 55
+        result["note"] = f"MACD cruzó a la baja la línea de señal"
+
+    return result
+
+
+def rsi_mean_reversion_signal(df: pd.DataFrame) -> Dict:
+    """
+    RSI(14) mean reversion with VWAP.
+    Detects oversold bounces and RSI crossovers from below.
+    """
+    result = {
+        "active": False,
+        "direction": "NEUTRAL",
+        "strength": 0,
+        "note": "Sin señal RSI",
+        "rsi_val": 50.0,
+        "vwap_val": 0.0,
+        "vwap_gap_pct": 0.0,
+    }
+
+    if df is None or len(df) < 15:
+        return result
+
+    close = df["close"]
+    volume = df.get("volume", pd.Series(np.ones(len(df))))
+    if "volume" not in df.columns:
+        volume = pd.Series(np.ones(len(df)), index=df.index)
+
+    rsi = calc_rsi(close, 14)
+    vwap = calc_vwap(close, volume)
+
+    if len(rsi) < 3:
+        return result
+
+    rsi_cur = float(rsi.iloc[-1])
+    rsi_prev = float(rsi.iloc[-2])
+    price_cur = float(close.iloc[-1])
+    vwap_cur = float(vwap.iloc[-1]) if not np.isnan(float(vwap.iloc[-1])) else price_cur
+
+    vwap_gap_pct = ((price_cur - vwap_cur) / vwap_cur * 100) if vwap_cur != 0 else 0.0
+    price_below_vwap = price_cur < vwap_cur
+
+    result["rsi_val"] = rsi_cur
+    result["vwap_val"] = vwap_cur
+    result["vwap_gap_pct"] = vwap_gap_pct
+
+    # Bullish: RSI was oversold (prev < 30) and turning up
+    oversold_bounce = (rsi_prev < 30) and (rsi_cur > rsi_prev)
+
+    # Bullish: RSI crossing above 35 from below
+    rsi_cross_35 = (rsi_prev < 35) and (rsi_cur >= 35)
+
+    # Bearish: RSI was overbought (prev > 70) and turning down
+    overbought_drop = (rsi_prev > 70) and (rsi_cur < rsi_prev)
+    rsi_cross_65 = (rsi_prev > 65) and (rsi_cur <= 65)
+
+    if oversold_bounce:
+        strength = 75 if price_below_vwap else 60
+        result["active"] = True
+        result["direction"] = "LONG"
+        result["strength"] = strength
+        result["note"] = (
+            f"RSI rebote desde sobreventa: {rsi_prev:.1f} → {rsi_cur:.1f}"
+            + (" · Precio bajo VWAP = entrada óptima" if price_below_vwap else "")
+        )
+    elif rsi_cross_35:
+        strength = 65 if price_below_vwap else 52
+        result["active"] = True
+        result["direction"] = "LONG"
+        result["strength"] = strength
+        result["note"] = (
+            f"RSI cruzó 35 al alza ({rsi_prev:.1f} → {rsi_cur:.1f})"
+            + (" · Precio bajo VWAP" if price_below_vwap else "")
+        )
+    elif overbought_drop or rsi_cross_65:
+        result["active"] = True
+        result["direction"] = "SHORT"
+        result["strength"] = 60
+        result["note"] = f"RSI girando desde sobrecompra: {rsi_prev:.1f} → {rsi_cur:.1f}"
+
+    return result
+
+
+def cvd_divergence_signal(df: pd.DataFrame) -> Dict:
+    """
+    OBV as CVD proxy. Detects bullish/bearish divergence over last 10 candles.
+    """
+    result = {
+        "active": False,
+        "direction": "NEUTRAL",
+        "strength": 0,
+        "note": "Sin divergencia CVD",
+        "divergence_type": "none",
+        "obv_slope": 0.0,
+        "price_slope": 0.0,
+    }
+
+    if df is None or len(df) < 12:
+        return result
+
+    close = df["close"]
+    volume = df.get("volume", pd.Series(np.ones(len(df))))
+    if "volume" not in df.columns:
+        volume = pd.Series(np.ones(len(df)), index=df.index)
+
+    obv = calc_obv(close, volume)
+
+    if len(obv) < 12:
+        return result
+
+    # Split last 10 candles into two halves of 5
+    half_a_price = close.iloc[-10:-5]   # older 5
+    half_b_price = close.iloc[-5:]       # recent 5
+    half_a_obv = obv.iloc[-10:-5]
+    half_b_obv = obv.iloc[-5:]
+
+    price_low_a = float(half_a_price.min())
+    price_low_b = float(half_b_price.min())
+    obv_low_a = float(half_a_obv.min())
+    obv_low_b = float(half_b_obv.min())
+
+    price_high_a = float(half_a_price.max())
+    price_high_b = float(half_b_price.max())
+    obv_high_a = float(half_a_obv.max())
+    obv_high_b = float(half_b_obv.max())
+
+    # Slope calculation using numpy linregress proxy
+    x = np.arange(10)
+    price_arr = close.iloc[-10:].values.astype(float)
+    obv_arr = obv.iloc[-10:].values.astype(float)
+
+    if len(price_arr) == 10 and not np.any(np.isnan(price_arr)):
+        price_slope = float(np.polyfit(x, price_arr, 1)[0])
+        obv_slope = float(np.polyfit(x, obv_arr, 1)[0])
+    else:
+        price_slope = 0.0
+        obv_slope = 0.0
+
+    result["obv_slope"] = obv_slope
+    result["price_slope"] = price_slope
+
+    # Bullish divergence: price making lower low, OBV making higher low
+    price_lower_low = price_low_b < price_low_a
+    obv_higher_low = obv_low_b > obv_low_a
+
+    # Bearish divergence: price making higher high, OBV making lower high
+    price_higher_high = price_high_b > price_high_a
+    obv_lower_high = obv_high_b < obv_high_a
+
+    if price_lower_low and obv_higher_low:
+        result["active"] = True
+        result["direction"] = "LONG"
+        result["divergence_type"] = "bullish"
+        result["strength"] = 70
+        result["note"] = (
+            "Divergencia alcista CVD: precio marca mínimo más bajo pero OBV marca mínimo más alto"
+            " — presión compradora oculta"
+        )
+    elif price_higher_high and obv_lower_high:
+        result["active"] = True
+        result["direction"] = "SHORT"
+        result["divergence_type"] = "bearish"
+        result["strength"] = 65
+        result["note"] = (
+            "Divergencia bajista CVD: precio marca máximo más alto pero OBV marca máximo más bajo"
+            " — distribución institucional"
+        )
+
+    return result
+
+
+def generate_trade_setup(coin: Dict, df: Optional[pd.DataFrame]) -> Dict:
+    """
+    Main function: generates a complete trade setup from coin market data and OHLCV df.
+    Combines MACD, RSI and CVD signals, calculates entry/SL/TP levels via ATR(7).
+    """
+    coin_id = coin.get("id", "")
+    symbol = coin.get("symbol", "").upper()
+    name = coin.get("name", "")
+    current_price = coin.get("current_price", 0.0)
+
+    _empty = {
+        "coin_id": coin_id,
+        "symbol": symbol,
+        "name": name,
+        "has_signal": False,
+        "confidence": 0,
+        "direction": "NEUTRAL",
+        "strategy": "—",
+        "strategy_code": "none",
+        "entry_price": current_price,
+        "stop_loss": 0.0,
+        "sl_pct": 0.0,
+        "tp1": 0.0, "tp1_pct": 0.0,
+        "tp2": 0.0, "tp2_pct": 0.0,
+        "tp3": 0.0, "tp3_pct": 0.0,
+        "rr_ratio": 0.0,
+        "win_probability": 0.0,
+        "loss_probability": 100.0,
+        "signal_strength": "DÉBIL",
+        "atr": 0.0,
+        "rsi_val": 50.0,
+        "macd_active": False,
+        "rsi_active": False,
+        "cvd_active": False,
+        "reasons": [],
+        "invalidation": "—",
+        "notes": "—",
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "status": "INACTIVE",
+    }
+
+    if df is None or len(df) < 15:
+        return _empty
+
+    # ── Step 1: Run all 3 strategies ────────────────────────────────────────
+    macd_sig = macd_strategy_signal(df)
+    rsi_sig = rsi_mean_reversion_signal(df)
+    cvd_sig = cvd_divergence_signal(df)
+
+    macd_active = macd_sig["active"]
+    rsi_active = rsi_sig["active"]
+    cvd_active = cvd_sig["active"]
+
+    active_signals = [s for s in [macd_sig, rsi_sig, cvd_sig] if s["active"]]
+    long_signals = [s for s in active_signals if s["direction"] == "LONG"]
+    short_signals = [s for s in active_signals if s["direction"] == "SHORT"]
+
+    # ── Step 2: Pick best / most confluent strategy ─────────────────────────
+    if not active_signals:
+        return _empty
+
+    # Determine dominant direction
+    if len(long_signals) >= len(short_signals):
+        dominant_signals = long_signals if long_signals else short_signals
+        direction = "LONG"
+    else:
+        dominant_signals = short_signals
+        direction = "SHORT"
+
+    if not dominant_signals:
+        return _empty
+
+    best_signal = max(dominant_signals, key=lambda s: s["strength"])
+    best_strength = best_signal["strength"]
+
+    # Name the strategy
+    num_agree = len(dominant_signals)
+    if num_agree >= 3:
+        strategy = "MACD + RSI + CVD Confluencia Total"
+        strategy_code = "confluence"
+    elif num_agree == 2:
+        names = []
+        if macd_active and macd_sig["direction"] == direction:
+            names.append("MACD")
+        if rsi_active and rsi_sig["direction"] == direction:
+            names.append("RSI")
+        if cvd_active and cvd_sig["direction"] == direction:
+            names.append("CVD")
+        strategy = " + ".join(names) + " Confluencia"
+        strategy_code = "confluence"
+    elif best_signal is macd_sig:
+        strategy = "MACD 3/15/3"
+        strategy_code = "macd"
+    elif best_signal is rsi_sig:
+        strategy = "RSI Mean Reversion"
+        strategy_code = "rsi"
+    else:
+        strategy = "CVD Divergencia"
+        strategy_code = "cvd"
+
+    # ── Step 3: ATR(7) for price levels ─────────────────────────────────────
+    atr_series = calc_atr(df["high"], df["low"], df["close"], period=7)
+    atr = float(atr_series.iloc[-1]) if not atr_series.empty else current_price * 0.02
+    if np.isnan(atr) or atr == 0:
+        atr = current_price * 0.015
+
+    entry_price = current_price
+
+    if direction == "LONG":
+        stop_loss = entry_price - atr * 1.2
+        tp1 = entry_price + atr * 1.5
+        tp2 = entry_price + atr * 2.5
+        tp3 = entry_price + atr * 4.0
+    else:  # SHORT
+        stop_loss = entry_price + atr * 1.2
+        tp1 = entry_price - atr * 1.5
+        tp2 = entry_price - atr * 2.5
+        tp3 = entry_price - atr * 4.0
+
+    sl_pct = (stop_loss - entry_price) / entry_price * 100
+    tp1_pct = (tp1 - entry_price) / entry_price * 100
+    tp2_pct = (tp2 - entry_price) / entry_price * 100
+    tp3_pct = (tp3 - entry_price) / entry_price * 100
+
+    # ── Step 4: R/R ratio ────────────────────────────────────────────────────
+    rr_ratio = abs(tp2_pct) / abs(sl_pct) if sl_pct != 0 else 0.0
+
+    # ── Step 5: Confidence ───────────────────────────────────────────────────
+    rsi_val = float(rsi_sig["rsi_val"])
+
+    confidence = best_strength
+    if num_agree == 2:
+        confidence += 10
+    elif num_agree >= 3:
+        confidence += 15
+
+    if rsi_val < 40 and direction == "LONG":
+        confidence += 5
+    elif rsi_val > 60 and direction == "SHORT":
+        confidence += 5
+
+    # Check 4H trend with EMA50
+    ema50 = calc_ema(df["close"], 50)
+    if len(ema50) >= 2:
+        ema50_slope = float(ema50.iloc[-1]) - float(ema50.iloc[-2])
+        if direction == "LONG" and ema50_slope < 0:
+            confidence -= 10
+        elif direction == "SHORT" and ema50_slope > 0:
+            confidence -= 10
+
+    confidence = max(0, min(95, int(confidence)))
+
+    # ── Step 6 & 7: Win/Loss probability ────────────────────────────────────
+    win_probability = confidence * 0.85 + 10
+    win_probability = max(20.0, min(90.0, win_probability))
+    loss_probability = 100.0 - win_probability
+
+    # ── Step 8: Signal strength label ───────────────────────────────────────
+    if confidence >= 80:
+        signal_strength = "MUY FUERTE"
+    elif confidence >= 65:
+        signal_strength = "FUERTE"
+    elif confidence >= 50:
+        signal_strength = "MODERADA"
+    else:
+        signal_strength = "DÉBIL"
+
+    # ── Step 9: Reasons (Spanish) ────────────────────────────────────────────
+    reasons = []
+    dir_str = "alcista" if direction == "LONG" else "bajista"
+
+    if macd_active and macd_sig["direction"] == direction:
+        reasons.append(f"MACD señal {dir_str}: {macd_sig['note']}")
+    if rsi_active and rsi_sig["direction"] == direction:
+        reasons.append(f"RSI señal {dir_str}: {rsi_sig['note']}")
+    if cvd_active and cvd_sig["direction"] == direction:
+        reasons.append(f"CVD/OBV: {cvd_sig['note']}")
+    if rr_ratio >= 2.0:
+        reasons.append(f"Ratio riesgo/recompensa favorable: {rr_ratio:.2f}× (TP2)")
+    if rsi_val < 35 and direction == "LONG":
+        reasons.append(f"RSI bajo ({rsi_val:.1f}) sugiere zona de valor — activo no sobrecomprado")
+    if num_agree >= 2:
+        reasons.append(f"Confluencia de {num_agree} indicadores en la misma dirección aumenta probabilidad")
+
+    vwap_gap = float(rsi_sig.get("vwap_gap_pct", 0.0))
+    if vwap_gap < -1.0 and direction == "LONG":
+        reasons.append(f"Precio {abs(vwap_gap):.1f}% bajo VWAP — zona de descuento respecto a precio justo")
+
+    if not reasons:
+        reasons.append(f"Señal técnica {dir_str} detectada por {strategy}")
+
+    # ── Step 10 & 11: Invalidation and notes ────────────────────────────────
+    invalidation = f"Cierre de vela por debajo de {fmt_price(stop_loss)}"
+    if direction == "SHORT":
+        invalidation = f"Cierre de vela por encima de {fmt_price(stop_loss)}"
+
+    notes = (
+        f"Esperar confirmación de vela de 30min cerrando en dirección {dir_str}. "
+        f"Entrada LIMIT en {fmt_price(entry_price)} o mejor. "
+        f"Gestión: mover SL a breakeven al alcanzar TP1 ({fmt_price(tp1)})."
+    )
+
+    # ── has_signal determination ─────────────────────────────────────────────
+    has_signal = (confidence >= 45) and len(active_signals) >= 1
+
+    return {
+        "coin_id": coin_id,
+        "symbol": symbol,
+        "name": name,
+        "direction": direction,
+        "strategy": strategy,
+        "strategy_code": strategy_code,
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "sl_pct": sl_pct,
+        "tp1": tp1,
+        "tp1_pct": tp1_pct,
+        "tp2": tp2,
+        "tp2_pct": tp2_pct,
+        "tp3": tp3,
+        "tp3_pct": tp3_pct,
+        "rr_ratio": rr_ratio,
+        "confidence": confidence,
+        "win_probability": win_probability,
+        "loss_probability": loss_probability,
+        "signal_strength": signal_strength,
+        "atr": atr,
+        "rsi_val": rsi_val,
+        "macd_active": macd_active,
+        "rsi_active": rsi_active,
+        "cvd_active": cvd_active,
+        "reasons": reasons,
+        "invalidation": invalidation,
+        "notes": notes,
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "status": "ACTIVE",
+        "has_signal": has_signal,
+    }
+
+
+def scan_trade_signals(
+    coins: List[Dict],
+    min_volume: float = 5_000_000,
+    top_n: int = 25,
+) -> List[Dict]:
+    """
+    Scans top coins by volume for trade setups.
+    Filters by min_volume, sorts by volume DESC, takes top_n.
+    Returns list of trade setups sorted by confidence DESC.
+    """
+    # Filter by minimum volume
+    liquid = [c for c in coins if c.get("total_volume", c.get("volume_24h", 0)) >= min_volume]
+    # Sort by volume descending
+    liquid.sort(
+        key=lambda x: x.get("total_volume", x.get("volume_24h", 0)),
+        reverse=True,
+    )
+    targets = liquid[:top_n]
+
+    results = []
+    for coin in targets:
+        try:
+            df = fetch_scalp_candles(coin["id"])
+            setup = generate_trade_setup(coin, df)
+            if setup.get("has_signal", False):
+                results.append(setup)
+        except Exception:
+            pass
+        time.sleep(0.4)
+
+    results.sort(key=lambda x: x["confidence"], reverse=True)
     return results

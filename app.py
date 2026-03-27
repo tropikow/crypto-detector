@@ -9,6 +9,8 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
+import json
+from datetime import datetime
 
 from engine import (
     fetch_markets, analyze_coin_quick, enrich_with_ohlcv,
@@ -16,6 +18,11 @@ from engine import (
     calc_obv, calc_cmf, calc_vwap,
     fmt_price, fmt_large,
     batch_scalp_scan, analyze_scalp,
+    scan_trade_signals, generate_trade_setup,
+)
+from trade_journal import (
+    open_trade, close_trade, get_open_trades, get_closed_trades,
+    get_learning, get_adaptive_weights, get_global_stats, delete_trade,
 )
 
 # ─────────────────────────────────────────
@@ -183,7 +190,7 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    st.caption("⚠️ Esto no es consejo financiero. Solo análisis técnico automatizado.")
+    st.caption("⚠️ Qué temes perder cuando no tienes nada?.")
 
 
 # ─────────────────────────────────────────
@@ -245,6 +252,7 @@ st.markdown("""
 # ─────────────────────────────────────────
 with st.spinner("📡 Cargando datos de mercado..."):
     all_data = load_data(n_coins)
+    st.session_state["all_data_cache"] = all_data
 
 mcap_min = MCAP_FILTERS[min_mcap]
 filtered = [
@@ -276,7 +284,389 @@ filtered = sorted(filtered, key=sort_key)
 # ─────────────────────────────────────────
 # TABS: Scalping vs Bull Detector
 # ─────────────────────────────────────────
-tab_scalp, tab_bull = st.tabs(["⚡ SCALPING 15-30 min", "🚀 BULL DETECTOR"])
+# Solicitar permiso de notificaciones + pre-inicializar AudioContext con primer clic
+st.components.v1.html("""
+<script>
+(function(){
+    // Notificaciones
+    if('Notification' in window && Notification.permission === 'default'){
+        Notification.requestPermission();
+    }
+    // Desbloquear AudioContext con el primer click/keydown del usuario
+    function unlockAudio(){
+        try {
+            var AC = window.AudioContext || window.webkitAudioContext;
+            if(!AC) return;
+            if(!window._cryptoAC){
+                window._cryptoAC = new AC();
+            }
+            if(window._cryptoAC.state === 'suspended'){
+                window._cryptoAC.resume();
+            }
+        } catch(e){}
+        document.removeEventListener('click', unlockAudio);
+        document.removeEventListener('keydown', unlockAudio);
+    }
+    document.addEventListener('click', unlockAudio);
+    document.addEventListener('keydown', unlockAudio);
+})();
+</script>
+""", height=0)
+
+tab_signals, tab_scalp, tab_bull, tab_journal = st.tabs(["🎯 SEÑALES DE TRADING", "⚡ SCALPING 15-30 min", "🚀 BULL DETECTOR", "📒 DIARIO"])
+
+# ══════════════════════════════════════════
+# TAB SEÑALES DE TRADING
+# ══════════════════════════════════════════
+with tab_signals:
+
+    if "trade_signals" not in st.session_state:
+        st.session_state["trade_signals"] = []
+    if "signals_seen" not in st.session_state:
+        st.session_state["signals_seen"] = set()
+
+    # Helper: build browser notification + beep JS for a list of signals
+    def _build_notification_js(sigs: list) -> str:
+        payload = json.dumps([{
+            "symbol": s["symbol"],
+            "direction": s["direction"],
+            "strategy": s["strategy"],
+            "entry": fmt_price(s["entry_price"]),
+            "sl": fmt_price(s["stop_loss"]),
+            "tp2": fmt_price(s["tp2"]),
+            "confidence": s["confidence"],
+        } for s in sigs])
+        return f"""
+        <script>
+        (function(){{
+            var signals = {payload};
+
+            // AudioContext requiere gesto del usuario — guardamos uno compartido en la ventana padre
+            function beep() {{
+                try {{
+                    var AC = window.AudioContext || window.webkitAudioContext;
+                    if (!AC) return;
+                    // Intenta reutilizar el contexto ya desbloqueado en el padre
+                    var ctx = (window.parent && window.parent._cryptoAC)
+                               ? window.parent._cryptoAC
+                               : new AC();
+                    if (ctx.state === 'suspended') {{ ctx.resume(); return; }}
+                    var freqs = [880,1100,880,1320];
+                    freqs.forEach(function(f,i){{
+                        var osc = ctx.createOscillator();
+                        var g = ctx.createGain();
+                        osc.connect(g); g.connect(ctx.destination);
+                        osc.frequency.value = f; osc.type = 'sine';
+                        var t = ctx.currentTime + i*0.18;
+                        g.gain.setValueAtTime(0.35, t);
+                        g.gain.exponentialRampToValueAtTime(0.001, t+0.15);
+                        osc.start(t); osc.stop(t+0.18);
+                    }});
+                }} catch(e) {{}}
+            }}
+
+            function notify(sig, delay) {{
+                setTimeout(function(){{
+                    if(!('Notification' in window)) return;
+                    if(Notification.permission !== 'granted') return;
+                    var n = new Notification(
+                        '🎯 ' + sig.direction + ' ENTRY: ' + sig.symbol,
+                        {{
+                            body: 'Estrategia: ' + sig.strategy + '\\nEntrada: ' + sig.entry +
+                                  ' | SL: ' + sig.sl + '\\nTP2: ' + sig.tp2 +
+                                  ' | Confianza: ' + sig.confidence + '%',
+                            requireInteraction: true,
+                            tag: 'crypto_' + sig.symbol + '_' + Date.now()
+                        }}
+                    );
+                    n.onclick = function(){{ window.focus(); n.close(); }};
+                }}, delay);
+            }}
+
+            beep();
+            signals.forEach(function(s,i){{ notify(s, i*600); }});
+        }})();
+        </script>
+        """
+
+    # Helper: render signal cards (reused by both manual and auto views)
+    def _render_signal_cards(signals: list, id_suffix: str = ""):
+        if not signals:
+            st.markdown("""
+            <div style="text-align:center; padding:50px 20px; color:#444;">
+              <div style="font-size:2.5rem">🎯</div>
+              <div style="margin-top:10px; font-size:1rem;">
+                Escaneando mercado... Las señales aparecerán aquí automáticamente.
+              </div>
+              <div style="font-size:0.82rem; color:#333; margin-top:6px;">
+                MACD 3/15/3 · RSI Mean Reversion · CVD Divergencia
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+            return
+
+        card_cols = st.columns(2)
+        for idx, sig in enumerate(signals):
+            col = card_cols[idx % 2]
+            with col:
+                _dir = sig.get("direction", "NEUTRAL")
+                _dc = "#00ff88" if _dir == "LONG" else ("#ff4444" if _dir == "SHORT" else "#888")
+                _dbg = "#00ff8818" if _dir == "LONG" else ("#ff444418" if _dir == "SHORT" else "#88888818")
+                _conf = sig.get("confidence", 0)
+                _win_p = sig.get("win_probability", 50.0)
+                _loss_p = sig.get("loss_probability", 50.0)
+                _strength = sig.get("signal_strength", "DÉBIL")
+                _cc = "#00ff88" if _conf >= 85 else ("#44ff44" if _conf >= 70 else ("#aadd00" if _conf >= 55 else "#ffaa00"))
+                _sc_map = {"MUY FUERTE": ("#00ff88","#00ff8830"), "FUERTE": ("#44cc44","#44cc4430"),
+                           "MODERADA": ("#ffaa00","#ffaa0030"), "DÉBIL": ("#ff6644","#ff664430")}
+                _sc, _sbg = _sc_map.get(_strength, ("#888","#88888830"))
+
+                def _badge(label, active):
+                    c = "#00ff88" if active else "#444"
+                    b = "#00ff8818" if active else "#44444418"
+                    return f'<span style="background:{b};color:{c};border:1px solid {c};border-radius:4px;padding:2px 6px;font-size:0.7rem;margin-right:3px;">{label}</span>'
+
+                badges = (_badge("MACD", sig.get("macd_active",False))
+                         + _badge("RSI", sig.get("rsi_active",False))
+                         + _badge("CVD", sig.get("cvd_active",False)))
+
+                st.markdown(f"""
+                <div style="background:#0d1117; border:1px solid #222;
+                            border-left:4px solid {_dc};
+                            border-radius:12px; padding:18px; margin-bottom:14px;">
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                      <span style="background:{_dbg};color:{_dc};border:1px solid {_dc};
+                                   border-radius:5px;padding:3px 10px;font-weight:800;font-size:0.82rem;">{_dir}</span>
+                      <span style="font-size:1.15rem;font-weight:800;color:#eee;">{sig['symbol']}</span>
+                      <span style="color:#666;font-size:0.82rem;">{sig['name']}</span>
+                    </div>
+                    <span style="color:#444;font-size:0.75rem;">🕐 {sig.get('timestamp','')}</span>
+                  </div>
+                  <div style="margin-bottom:10px;">
+                    <span style="color:#5599ff;font-size:0.8rem;font-weight:600;">{sig['strategy']}</span>
+                    &nbsp;{badges}
+                  </div>
+                  <div style="font-size:1.55rem;font-weight:900;color:#fff;margin-bottom:12px;">
+                    {fmt_price(sig['entry_price'])}
+                    <span style="font-size:0.75rem;color:#555;font-weight:400;margin-left:6px;">ENTRADA LIMIT</span>
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px;margin-bottom:12px;">
+                    <div style="background:#0a1a0a;border-radius:7px;padding:9px;text-align:center;">
+                      <div style="color:#888;font-size:0.68rem;margin-bottom:3px;">STOP LOSS</div>
+                      <div style="color:#ff4444;font-weight:700;font-size:0.9rem;">{fmt_price(sig['stop_loss'])}</div>
+                      <div style="color:#ff6666;font-size:0.68rem;">{sig['sl_pct']:.2f}%</div>
+                    </div>
+                    <div style="background:#0a0a1a;border-radius:7px;padding:9px;text-align:center;">
+                      <div style="color:#888;font-size:0.68rem;margin-bottom:3px;">R/R RATIO</div>
+                      <div style="color:{'#00ff88' if sig['rr_ratio']>=2 else '#ffaa00'};font-weight:700;font-size:0.9rem;">{sig['rr_ratio']:.2f}×</div>
+                    </div>
+                    <div style="background:#1a1a0a;border-radius:7px;padding:9px;text-align:center;">
+                      <div style="color:#888;font-size:0.68rem;margin-bottom:3px;">ATR</div>
+                      <div style="color:#ffaa44;font-weight:700;font-size:0.9rem;">{fmt_price(sig.get('atr',0))}</div>
+                    </div>
+                  </div>
+                  <div style="color:#666;font-size:0.72rem;margin-bottom:5px;font-weight:600;letter-spacing:0.4px;">OBJETIVOS</div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:12px;">
+                    <div style="background:#0a1a0a;border:1px solid #00ff8830;border-radius:6px;padding:7px;text-align:center;">
+                      <div style="color:#66cc66;font-size:0.68rem;">TP1</div>
+                      <div style="color:#88ee88;font-weight:700;font-size:0.82rem;">{fmt_price(sig['tp1'])}</div>
+                      <div style="color:#66cc66;font-size:0.68rem;">+{sig['tp1_pct']:.1f}%</div>
+                    </div>
+                    <div style="background:#0d1f0d;border:1px solid #00ff8855;border-radius:6px;padding:7px;text-align:center;">
+                      <div style="color:#99dd99;font-size:0.68rem;">TP2 ⭐</div>
+                      <div style="color:#aaffaa;font-weight:800;font-size:0.88rem;">{fmt_price(sig['tp2'])}</div>
+                      <div style="color:#99dd99;font-size:0.68rem;">+{sig['tp2_pct']:.1f}%</div>
+                    </div>
+                    <div style="background:#102010;border:1px solid #00ff8888;border-radius:6px;padding:7px;text-align:center;">
+                      <div style="color:#bbddbb;font-size:0.68rem;">TP3 🚀</div>
+                      <div style="color:#ccffcc;font-weight:700;font-size:0.82rem;">{fmt_price(sig['tp3'])}</div>
+                      <div style="color:#bbddbb;font-size:0.68rem;">+{sig['tp3_pct']:.1f}%</div>
+                    </div>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                    <span style="color:#777;font-size:0.72rem;">CONFIANZA</span>
+                    <span style="color:{_cc};font-weight:700;font-size:0.78rem;">{_conf}%</span>
+                  </div>
+                  <div style="background:#111;border-radius:4px;height:5px;margin-bottom:10px;">
+                    <div style="background:{_cc};width:{_conf}%;height:100%;border-radius:4px;"></div>
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:10px;">
+                    <div>
+                      <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+                        <span style="color:#666;font-size:0.7rem;">✅ PROB. GANANCIA</span>
+                        <span style="color:#00ff88;font-size:0.7rem;font-weight:700;">{_win_p:.0f}%</span>
+                      </div>
+                      <div style="background:#111;border-radius:3px;height:4px;">
+                        <div style="background:#00ff88;width:{_win_p}%;height:100%;border-radius:3px;"></div>
+                      </div>
+                    </div>
+                    <div>
+                      <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+                        <span style="color:#666;font-size:0.7rem;">❌ PROB. PÉRDIDA</span>
+                        <span style="color:#ff4444;font-size:0.7rem;font-weight:700;">{_loss_p:.0f}%</span>
+                      </div>
+                      <div style="background:#111;border-radius:3px;height:4px;">
+                        <div style="background:#ff4444;width:{_loss_p}%;height:100%;border-radius:3px;"></div>
+                      </div>
+                    </div>
+                  </div>
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                    <span style="background:{_sbg};color:{_sc};border:1px solid {_sc};
+                                 border-radius:5px;padding:3px 10px;font-size:0.75rem;font-weight:700;">
+                      {_strength}
+                    </span>
+                    <span style="color:#555;font-size:0.72rem;">RSI: {sig.get('rsi_val',0):.1f}</span>
+                  </div>
+                  <div style="background:#0a1520;border:1px solid #0044aa33;border-radius:7px;padding:10px;margin-bottom:8px;">
+                    <div style="color:#4488cc;font-size:0.75rem;font-weight:700;margin-bottom:5px;">🎯 CUÁNDO ENTRAR</div>
+                    <div style="color:#99bbcc;font-size:0.78rem;line-height:1.5;">
+                      <b>Precio:</b> {fmt_price(sig['entry_price'])} &nbsp;·&nbsp;
+                      <b>Orden:</b> LIMIT &nbsp;·&nbsp; <b>TF:</b> 30min<br>
+                      <span style="color:#5577aa;font-size:0.75rem;">{sig.get('notes','')}</span>
+                    </div>
+                  </div>
+                  <div style="color:#ff555555;font-size:0.72rem;">
+                    ⛔ <b>Invalidación:</b> {sig.get('invalidation','—')}
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                _reasons = sig.get("reasons", [])
+                if _reasons:
+                    with st.expander(f"📋 Análisis del bot ({len(_reasons)} razones)", expanded=False):
+                        for r in _reasons:
+                            st.markdown(f"- {r}")
+
+                if st.button(f"📒 Registrar en Diario · {sig['symbol']}",
+                             key=f"reg_{sig['coin_id']}_{id_suffix}_{idx}",
+                             use_container_width=True):
+                    _open_ids = {t["coin_id"] for t in get_open_trades()}
+                    if sig["coin_id"] not in _open_ids:
+                        open_trade(sig)
+                        st.toast(f"📒 {sig['symbol']} registrado en el diario", icon="✅")
+                    else:
+                        st.toast(f"⚠️ {sig['symbol']} ya tiene posición abierta", icon="⚠️")
+
+    # Header
+    st.markdown("""
+    <div style="background:linear-gradient(135deg,#051a05,#0a2a0a);
+                border:1px solid #00cc4433;border-radius:12px;padding:18px 24px;margin-bottom:16px;">
+      <div style="font-size:1.4rem;font-weight:900;color:#00ff88;margin-bottom:5px;">
+        🎯 SEÑALES DE TRADING — Motor Estratégico
+      </div>
+      <div style="color:#88aa88;font-size:0.85rem;line-height:1.5;">
+        Escaneo automático cada <b style="color:#00ff88">30 segundos</b> ·
+        Estrategias: <b style="color:#00ff88">MACD 3/15/3 · RSI Mean Reversion · CVD Divergencia</b><br>
+        Cuando detecte una entrada, recibirás una <b style="color:#ffaa00">notificación del navegador + alerta sonora</b>.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Controls (outside fragment so they persist)
+    ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 1])
+    with ctrl1:
+        top_n_sig = st.slider("Monedas a escanear", 10, 40, 20, 5, key="sig_top_n")
+    with ctrl2:
+        _conf_opts = {"Todas (>40%)": 40, "Moderada (>55%)": 55, "Fuerte (>65%)": 65, "Muy Fuerte (>75%)": 75}
+        _conf_label = st.selectbox("Filtro de confianza mínima", list(_conf_opts.keys()), key="sig_conf_filter")
+        min_conf = _conf_opts[_conf_label]
+    with ctrl3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        force_scan = st.button("🔍 Escanear ahora", use_container_width=True, type="primary", key="force_scan_btn")
+
+    # ── AUTO-SCAN FRAGMENT (re-runs every 30s automatically) ──
+    @st.fragment(run_every=30)
+    def _signals_scanner():
+        _prev_ids = {s["coin_id"] for s in st.session_state.get("trade_signals", [])}
+        _coins = st.session_state.get("all_data_cache", [])
+
+        if not _coins:
+            st.warning("Sin datos de mercado disponibles.")
+            return
+
+        _adapted = [{**c, "volume_24h": c.get("volume_24h", c.get("total_volume", 0))} for c in _coins]
+
+        with st.spinner("⚡ Escaneando señales..."):
+            @st.cache_data(ttl=180, show_spinner=False)
+            def _cached_scan(n: int):
+                return scan_trade_signals(_adapted, min_volume=5_000_000, top_n=n)
+            _new_signals = _cached_scan(st.session_state.get("sig_top_n", 20))
+
+        st.session_state["trade_signals"] = _new_signals
+
+        # Detect truly new signals (not seen before)
+        _truly_new = [s for s in _new_signals if s["coin_id"] not in _prev_ids
+                      and s.get("confidence", 0) >= 50]
+
+        if _truly_new:
+            # Fire browser notifications + beep
+            st.components.v1.html(_build_notification_js(_truly_new), height=0)
+            for s in _truly_new:
+                st.toast(
+                    f"🎯 {s['direction']} {s['symbol']} · {s['strategy']} · {s['confidence']}%",
+                    icon="🚀"
+                )
+            _seen = st.session_state.get("signals_seen", set())
+            for s in _truly_new:
+                _seen.add(s["coin_id"])
+            st.session_state["signals_seen"] = _seen
+
+        # Status bar
+        _now = datetime.now().strftime("%H:%M:%S")
+        _total = len(_new_signals)
+        _fire = sum(1 for s in _new_signals if s.get("confidence", 0) >= 70)
+        _color = "#00ff88" if _fire > 0 else "#666"
+        st.markdown(f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;
+                    background:#0a0a0a;border:1px solid #1a1a1a;border-radius:8px;
+                    padding:8px 14px;margin-bottom:14px;font-size:0.8rem;">
+          <span style="color:#444;">🔄 Último escaneo: <b style="color:#666;">{_now}</b> · Próximo en ~30s</span>
+          <span style="color:{_color};font-weight:700;">{_total} señales · {_fire} de alta confianza</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # KPIs
+        _filtered = [s for s in _new_signals if s.get("confidence", 0) >= st.session_state.get("sig_conf_filter_val", 40)]
+        if _new_signals:
+            k1, k2, k3, k4 = st.columns(4)
+            _longs = sum(1 for s in _filtered if s.get("direction") == "LONG")
+            _strong = sum(1 for s in _filtered if s.get("signal_strength") in ("MUY FUERTE","FUERTE"))
+            _best = max((s.get("confidence",0) for s in _filtered), default=0)
+            for k, v, lbl, clr in [
+                (k1, len(_filtered), "SEÑALES", "#fff"),
+                (k2, _longs, "LONG", "#00ff88"),
+                (k3, _strong, "FUERTE/MUY FUERTE", "#ffaa00"),
+                (k4, f"{_best}%", "MEJOR CONFIANZA", "#5599ff"),
+            ]:
+                k.markdown(f"""
+                <div class="metric-card">
+                  <div class="metric-value" style="color:{clr}">{v}</div>
+                  <div class="metric-label">{lbl}</div>
+                </div>""", unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
+
+        # Filter and render cards
+        _show = [s for s in _new_signals
+                 if s.get("confidence", 0) >= st.session_state.get("sig_conf_filter_val", 40)]
+        _render_signal_cards(_show, id_suffix="auto")
+
+    # Store conf threshold in session state so fragment can read it
+    st.session_state["sig_conf_filter_val"] = min_conf
+
+    # Force scan clears cache so next fragment run fetches fresh
+    if force_scan:
+        st.cache_data.clear()
+
+    _signals_scanner()
+
+    st.markdown("""
+    <div style="text-align:center;color:#2a2a2a;font-size:0.74rem;
+                border-top:1px solid #111;padding-top:12px;margin-top:24px;">
+      ⚠️ Arriesgate siempre para ganar.
+    </div>
+    """, unsafe_allow_html=True)
+
 
 # ══════════════════════════════════════════
 # TAB SCALPING
@@ -1553,3 +1943,327 @@ with tab_bull:
       Datos: CoinGecko API · Indicadores: RSI, MACD, Bollinger Bands, EMAs, Estocástico, ATR
     </div>
     """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════
+# TAB DIARIO DE OPERACIONES
+# ══════════════════════════════════════════
+with tab_journal:
+    import plotly.graph_objects as go_j
+    import pandas as pd_j
+
+    st.markdown("""
+    <div style="background:linear-gradient(135deg,#0d0d1f,#1a1020);
+                border:1px solid #7744ff33;border-radius:12px;padding:18px 24px;margin-bottom:16px;">
+      <div style="font-size:1.4rem;font-weight:900;color:#9966ff;margin-bottom:5px;">
+        📒 DIARIO DE OPERACIONES — Aprendizaje Adaptativo
+      </div>
+      <div style="color:#8877aa;font-size:0.85rem;line-height:1.5;">
+        Registra tus entradas y salidas. El bot <b style="color:#9966ff">aprende de cada operación</b> —
+        victorias y derrotas — para ajustar su confianza y mejorar sus señales futuras.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Global stats ──
+    gs = get_global_stats()
+    lrn = get_learning()
+
+    gs_cols = st.columns(6)
+    for col, val, lbl, clr in [
+        (gs_cols[0], gs["total"], "TOTAL OPS", "#9966ff"),
+        (gs_cols[1], gs["open"], "ABIERTAS", "#ffaa00"),
+        (gs_cols[2], gs["wins"], "VICTORIAS", "#00ff88"),
+        (gs_cols[3], gs["losses"], "DERROTAS", "#ff4444"),
+        (gs_cols[4], f"{gs['win_rate']}%", "WIN RATE", "#00ff88" if gs["win_rate"] >= 55 else "#ff4444"),
+        (gs_cols[5], f"{gs['avg_pnl']:+.2f}%", "P&L MEDIO", "#00ff88" if gs["avg_pnl"] >= 0 else "#ff4444"),
+    ]:
+        col.markdown(f"""
+        <div style="background:#111;border:1px solid #222;border-radius:8px;
+                    padding:10px;text-align:center;margin-bottom:8px;">
+          <div style="font-size:1.5rem;font-weight:900;color:{clr}">{val}</div>
+          <div style="font-size:0.68rem;color:#555">{lbl}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── OPEN POSITIONS ──
+    open_trades = get_open_trades()
+    st.markdown(f"#### 🟡 Posiciones Abiertas ({len(open_trades)})")
+
+    if not open_trades:
+        st.markdown("""
+        <div style="background:#111;border:1px dashed #333;border-radius:8px;
+                    padding:30px;text-align:center;color:#444;">
+          No hay posiciones abiertas. Registra operaciones desde el tab <b>🎯 SEÑALES</b>.
+        </div>""", unsafe_allow_html=True)
+    else:
+        price_map = {c.get("id",""): c.get("current_price",0)
+                     for c in st.session_state.get("all_data_cache",[])}
+
+        for tr in open_trades:
+            entry = tr["entry_price"]
+            cur = price_map.get(tr["coin_id"], entry)
+            live_pnl = (cur - entry) / entry * 100 if tr["direction"] == "LONG" else (entry - cur) / entry * 100
+            pnl_clr = "#00ff88" if live_pnl >= 0 else "#ff4444"
+            dir_clr = "#00ff88" if tr["direction"] == "LONG" else "#ff4444"
+
+            with st.expander(
+                f"{'🟢' if live_pnl >= 0 else '🔴'} {tr['symbol']} {tr['direction']} · "
+                f"Entrada: {tr['entry_price']:.6g} · P&L live: {live_pnl:+.2f}%",
+                expanded=True
+            ):
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Entrada", f"${entry:.6g}")
+                c2.metric("Precio actual", f"${cur:.6g}", delta=f"{live_pnl:+.2f}%")
+                c3.metric("Stop Loss", f"${tr['stop_loss']:.6g}", delta=f"{abs(tr.get('sl_pct',0)):.1f}% abajo", delta_color="inverse")
+                c4.metric("TP2", f"${tr['tp2']:.6g}", delta=f"+{tr.get('tp2_pct',0):.1f}%")
+                c5.metric("R/R", f"{tr.get('rr_ratio',0):.2f}×")
+
+                st.markdown(f"""
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;">
+                  <span style="background:#9966ff22;color:#9966ff;border:1px solid #9966ff44;
+                               border-radius:5px;padding:3px 10px;font-size:0.78rem;font-weight:700;">
+                    {tr['strategy']}
+                  </span>
+                  <span style="background:{dir_clr}22;color:{dir_clr};border:1px solid {dir_clr}44;
+                               border-radius:5px;padding:3px 10px;font-size:0.78rem;font-weight:700;">
+                    {tr['direction']}
+                  </span>
+                  <span style="color:#555;font-size:0.78rem;padding:3px 8px;">
+                    🕐 Abierta: {tr['opened_at']}
+                  </span>
+                </div>""", unsafe_allow_html=True)
+
+                # TP levels visual
+                st.markdown(f"""
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin:8px 0;">
+                  <div style="background:#0a1a0a;border:1px solid #00ff8830;border-radius:6px;padding:8px;text-align:center;">
+                    <div style="color:#66cc66;font-size:0.7rem;">TP1</div>
+                    <div style="color:#88ee88;font-weight:700;">${tr['tp1']:.6g}</div>
+                    <div style="color:#66cc66;font-size:0.7rem;">+{tr['tp1_pct']:.1f}%</div>
+                  </div>
+                  <div style="background:#0d2a0d;border:1px solid #00ff8855;border-radius:6px;padding:8px;text-align:center;">
+                    <div style="color:#99dd99;font-size:0.7rem;">TP2 ⭐</div>
+                    <div style="color:#aaffaa;font-weight:800;">${tr['tp2']:.6g}</div>
+                    <div style="color:#99dd99;font-size:0.7rem;">+{tr['tp2_pct']:.1f}%</div>
+                  </div>
+                  <div style="background:#102010;border:1px solid #00ff8877;border-radius:6px;padding:8px;text-align:center;">
+                    <div style="color:#bbddbb;font-size:0.7rem;">TP3 🚀</div>
+                    <div style="color:#ccffcc;font-weight:700;">${tr['tp3']:.6g}</div>
+                    <div style="color:#bbddbb;font-size:0.7rem;">+{tr['tp3_pct']:.1f}%</div>
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+                # Close trade form
+                st.markdown("**📤 Cerrar operación:**")
+                close_c1, close_c2, close_c3 = st.columns([2, 2, 1])
+                with close_c1:
+                    exit_px = st.number_input(
+                        "Precio de salida",
+                        value=float(cur) if cur else float(entry),
+                        min_value=0.0,
+                        format="%.8f",
+                        key=f"exit_px_{tr['id']}",
+                    )
+                with close_c2:
+                    user_notes = st.text_input(
+                        "Notas (opcional)",
+                        placeholder="¿Por qué saliste? ¿Qué aprendiste?",
+                        key=f"notes_{tr['id']}",
+                    )
+                with close_c3:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if exit_px > 0:
+                        preview_pnl = (exit_px - entry) / entry * 100 if tr["direction"] == "LONG" else (entry - exit_px) / entry * 100
+                        result_label = "✅ GANANCIA" if preview_pnl > 0.15 else ("❌ PÉRDIDA" if preview_pnl < -0.15 else "➖ BREAKEVEN")
+                        result_color = "#00ff88" if preview_pnl > 0.15 else ("#ff4444" if preview_pnl < -0.15 else "#888")
+                        st.markdown(f'<div style="color:{result_color};font-weight:700;font-size:0.9rem;text-align:center;">{result_label}<br>{preview_pnl:+.2f}%</div>', unsafe_allow_html=True)
+
+                col_close, col_del = st.columns([3, 1])
+                with col_close:
+                    if st.button(f"📤 Cerrar {tr['symbol']} @ ${exit_px:.6g}", key=f"close_{tr['id']}", type="primary", use_container_width=True):
+                        result = close_trade(tr["id"], exit_px, user_notes)
+                        r = result.get("result","")
+                        pnl = result.get("pnl_pct", 0)
+                        icon = "🏆" if r == "WIN" else ("💔" if r == "LOSS" else "➖")
+                        st.toast(f"{icon} {tr['symbol']} cerrado: {r} · {pnl:+.2f}%", icon=icon)
+                        st.rerun()
+                with col_del:
+                    if st.button("🗑️", key=f"del_{tr['id']}", use_container_width=True, help="Eliminar esta operación"):
+                        delete_trade(tr["id"])
+                        st.rerun()
+
+    st.markdown("---")
+
+    # ── LEARNING INTELLIGENCE ──
+    st.markdown("#### 🧠 Inteligencia Adaptativa — Lo que el bot ha aprendido")
+
+    if not lrn or lrn.get("total_closed", 0) < 1:
+        st.markdown("""
+        <div style="background:#0a0a15;border:1px dashed #333;border-radius:8px;
+                    padding:30px;text-align:center;color:#444;">
+          <div style="font-size:2rem;">🧠</div>
+          <div style="margin-top:10px;">El bot aún no tiene datos de aprendizaje.<br>
+          <span style="color:#555">Registra y cierra al menos 1 operación para activar la IA adaptativa.</span></div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        # Overall win rate gauge
+        wr = lrn.get("overall_win_rate", 0)
+        avg_pnl = lrn.get("overall_avg_pnl", 0)
+        best_combo = lrn.get("best_combo", "—")
+        adaptive = lrn.get("adaptive_weights", {})
+
+        la1, la2, la3 = st.columns(3)
+        wr_clr = "#00ff88" if wr >= 60 else ("#ffaa00" if wr >= 45 else "#ff4444")
+        with la1:
+            st.markdown(f"""
+            <div style="background:#111;border:1px solid {wr_clr}33;border-radius:10px;padding:16px;text-align:center;">
+              <div style="font-size:0.75rem;color:#666;margin-bottom:4px;">WIN RATE GLOBAL</div>
+              <div style="font-size:2.5rem;font-weight:900;color:{wr_clr}">{wr}%</div>
+              <div style="background:#222;border-radius:4px;height:6px;margin-top:8px;">
+                <div style="background:{wr_clr};width:{wr}%;height:100%;border-radius:4px;"></div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+        with la2:
+            p_clr = "#00ff88" if avg_pnl >= 0 else "#ff4444"
+            st.markdown(f"""
+            <div style="background:#111;border:1px solid {p_clr}33;border-radius:10px;padding:16px;text-align:center;">
+              <div style="font-size:0.75rem;color:#666;margin-bottom:4px;">P&L PROMEDIO</div>
+              <div style="font-size:2.5rem;font-weight:900;color:{p_clr}">{avg_pnl:+.2f}%</div>
+              <div style="font-size:0.78rem;color:#555;margin-top:6px;">{lrn.get('total_closed',0)} operaciones cerradas</div>
+            </div>""", unsafe_allow_html=True)
+        with la3:
+            st.markdown(f"""
+            <div style="background:#111;border:1px solid #9966ff33;border-radius:10px;padding:16px;text-align:center;">
+              <div style="font-size:0.75rem;color:#666;margin-bottom:4px;">COMBO MÁS RENTABLE</div>
+              <div style="font-size:1.2rem;font-weight:900;color:#9966ff;margin-top:4px;">{best_combo or '—'}</div>
+              <div style="font-size:0.75rem;color:#555;margin-top:6px;">Indicadores más efectivos</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Strategy stats chart
+        strat_stats = lrn.get("strategy_stats", {})
+        if strat_stats:
+            st.markdown("##### 📊 Rendimiento por Estrategia")
+            strat_names = list(strat_stats.keys())
+            strat_wr = [strat_stats[s]["win_rate"] for s in strat_names]
+            strat_pnl = [strat_stats[s]["avg_pnl"] for s in strat_names]
+            strat_total = [strat_stats[s]["total"] for s in strat_names]
+
+            # Bar colors based on win rate
+            bar_colors = ["#00ff88" if w >= 60 else "#ffaa00" if w >= 45 else "#ff4444" for w in strat_wr]
+
+            fig_s = go.Figure()
+            fig_s.add_trace(go.Bar(
+                x=strat_names, y=strat_wr,
+                marker_color=bar_colors,
+                text=[f"{w}% ({t} ops)" for w, t in zip(strat_wr, strat_total)],
+                textposition="outside",
+                name="Win Rate %",
+            ))
+            fig_s.add_hline(y=55, line_dash="dash", line_color="rgba(0,255,136,0.4)",
+                            annotation_text="55% objetivo")
+            fig_s.update_layout(
+                height=280, template="plotly_dark",
+                paper_bgcolor="#111", plot_bgcolor="#111",
+                margin=dict(l=10, r=10, t=20, b=10),
+                yaxis=dict(title="Win Rate %", range=[0, 110], gridcolor="#1e1e1e"),
+                xaxis=dict(gridcolor="#1e1e1e"),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_s, use_container_width=True)
+
+        # Two columns: indicator combos + adaptive weights
+        lcol1, lcol2 = st.columns(2)
+
+        with lcol1:
+            ind_stats = lrn.get("indicator_stats", {})
+            if ind_stats:
+                st.markdown("##### 🔧 Rendimiento por Combinación de Indicadores")
+                rows_i = []
+                for combo, st_data in sorted(ind_stats.items(), key=lambda x: x[1]["win_rate"], reverse=True):
+                    wr_i = st_data["win_rate"]
+                    clr = "🟢" if wr_i >= 60 else ("🟡" if wr_i >= 45 else "🔴")
+                    rows_i.append({
+                        "Indicadores": combo,
+                        "Win Rate": f"{clr} {wr_i}%",
+                        "Ops": st_data["total"],
+                        "P&L Medio": f"{st_data['avg_pnl']:+.2f}%",
+                    })
+                st.dataframe(pd_j.DataFrame(rows_i), use_container_width=True, hide_index=True)
+
+        with lcol2:
+            if adaptive:
+                st.markdown("##### ⚙️ Multiplicadores Adaptativos Activos")
+                st.markdown("""
+                <div style="background:#0a0a15;border:1px solid #333;border-radius:8px;padding:10px;margin-bottom:8px;font-size:0.78rem;color:#666;">
+                  El bot aplica estos multiplicadores automáticamente a las señales futuras.
+                  Más de 3 operaciones cerradas por estrategia activan el ajuste.
+                </div>""", unsafe_allow_html=True)
+                for strat, mult in sorted(adaptive.items(), key=lambda x: x[1], reverse=True):
+                    m_clr = "#00ff88" if mult >= 1.05 else ("#ff4444" if mult < 0.95 else "#ffaa00")
+                    m_label = "BOOST" if mult >= 1.05 else ("PENALIZACIÓN" if mult < 0.95 else "NEUTRO")
+                    st.markdown(f"""
+                    <div style="background:#111;border:1px solid #222;border-radius:6px;
+                                padding:8px 12px;margin-bottom:5px;
+                                display:flex;justify-content:space-between;align-items:center;">
+                      <span style="color:#ccc;font-size:0.82rem;">{strat}</span>
+                      <span style="color:{m_clr};font-weight:800;font-size:0.88rem;">
+                        ×{mult:.2f} — {m_label}
+                      </span>
+                    </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown("##### ⚙️ Multiplicadores Adaptativos")
+                st.info("Se activarán cuando cada estrategia tenga ≥3 operaciones cerradas.")
+
+        # RSI stats
+        rsi_stats = lrn.get("rsi_stats", {})
+        if rsi_stats:
+            st.markdown("---")
+            st.markdown("##### 📊 Win Rate por Rango de RSI al momento de la entrada")
+            rsi_cols = st.columns(len(rsi_stats))
+            for rc, (rng, rdata) in zip(rsi_cols, rsi_stats.items()):
+                rwr = rdata["win_rate"]
+                rc_clr = "#00ff88" if rwr >= 60 else ("#ffaa00" if rwr >= 45 else "#ff4444")
+                rc.markdown(f"""
+                <div style="background:#111;border:1px solid {rc_clr}33;border-radius:8px;
+                            padding:12px;text-align:center;">
+                  <div style="font-size:0.7rem;color:#666;margin-bottom:4px;">{rng}</div>
+                  <div style="font-size:1.5rem;font-weight:800;color:{rc_clr}">{rwr}%</div>
+                  <div style="font-size:0.7rem;color:#555">{rdata['total']} ops</div>
+                </div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── CLOSED TRADES HISTORY ──
+    st.markdown("#### 📜 Historial de Operaciones Cerradas")
+    closed_trades = get_closed_trades()
+
+    if not closed_trades:
+        st.markdown('<div style="color:#444;text-align:center;padding:20px;">No hay operaciones cerradas aún.</div>', unsafe_allow_html=True)
+    else:
+        hist_rows = []
+        for t in closed_trades:
+            result = t.get("result","")
+            icon = "🏆" if result == "WIN" else ("💔" if result == "LOSS" else "➖")
+            pnl = t.get("pnl_pct", 0) or 0
+            hist_rows.append({
+                "": icon,
+                "Símbolo": t.get("symbol",""),
+                "Dirección": t.get("direction",""),
+                "Estrategia": t.get("strategy",""),
+                "Entrada": f"${t.get('entry_price',0):.6g}",
+                "Salida": f"${t.get('exit_price',0):.6g}",
+                "P&L": f"{pnl:+.2f}%",
+                "Resultado": result,
+                "TP alcanzado": f"TP{t.get('hit_tp','')}" if t.get('hit_tp') else "—",
+                "Confianza": f"{t.get('confidence',0)}%",
+                "Cerrada": t.get("closed_at",""),
+                "Notas": t.get("user_notes",""),
+            })
+
+        df_hist = pd_j.DataFrame(hist_rows)
+        st.dataframe(df_hist, use_container_width=True, hide_index=True,
+                     height=min(60 + len(df_hist) * 36, 500))
